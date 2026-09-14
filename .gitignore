@@ -1,5 +1,6 @@
-﻿venv/
-
+﻿.venv/
+__pycache__/
+.telegram-cleaner.json
+telegram-cleaner.session*
 cache
-client.session
-client.session-journal
+client.session*

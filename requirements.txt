@@ -1,3 +1,2 @@
-tgcrypto # Optional, for faster cleaning. You could remove this line
-pyrotgfork==2.2.24
+telethon==1.45.0
 qrcode

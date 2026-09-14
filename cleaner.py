@@ -1,303 +1,338 @@
-import os
+from __future__ import annotations
+
+import asyncio
 import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
 
-from asyncio import sleep
-
-from pyrogram import Client, enums, raw
-from pyrogram.errors import FloodWait, UnknownError
+from telethon import TelegramClient, functions, types
+from telethon.errors import FloodWaitError
 
 from qr_auth import login_with_qr
 
-cachePath = os.path.abspath(__file__)
-cachePath = os.path.dirname(cachePath)
-cachePath = os.path.join(cachePath, "cache")
+PROJECT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_DIR / ".telegram-cleaner.json"
+LEGACY_CONFIG_PATH = PROJECT_DIR / "cache"
+SESSION_PATH = PROJECT_DIR / "telegram-cleaner"
+DELETE_CHUNK_SIZE = 100
 
-if os.path.exists(cachePath):
-    with open(cachePath, "r") as cacheFile:
-        cache = json.loads(cacheFile.read())
-    
-    API_ID = cache["API_ID"]
-    API_HASH = cache["API_HASH"]
-else:
-    API_ID = os.getenv('API_ID', None) or int(input('Enter your Telegram API id: '))
-    API_HASH = os.getenv('API_HASH', None) or input('Enter your Telegram API hash: ')
+Group = types.Chat | types.Channel
 
-app = Client("client", api_id=API_ID, api_hash=API_HASH)
 
-if not os.path.exists(cachePath):
-    with open(cachePath, "w") as cacheFile:
-        cache = {"API_ID": API_ID, "API_HASH": API_HASH}
-        cacheFile.write(json.dumps(cache))
+@dataclass(frozen=True)
+class ApiCredentials:
+    api_id: int
+    api_hash: str
+
+
+def read_cached_credentials() -> ApiCredentials | None:
+    """Read current or legacy cached credentials without failing on bad data."""
+    for path, id_key, hash_key in (
+        (CONFIG_PATH, "api_id", "api_hash"),
+        (LEGACY_CONFIG_PATH, "API_ID", "API_HASH"),
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return ApiCredentials(api_id=int(data[id_key]), api_hash=str(data[hash_key]))
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def save_credentials(credentials: ApiCredentials) -> None:
+    CONFIG_PATH.write_text(
+        json.dumps({"api_id": credentials.api_id, "api_hash": credentials.api_hash}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_api_credentials() -> ApiCredentials:
+    """Load credentials from the environment, cache, or interactive prompts."""
+    api_id = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    if api_id and api_hash:
+        try:
+            return ApiCredentials(api_id=int(api_id), api_hash=api_hash)
+        except ValueError as error:
+            raise ValueError("API_ID must be an integer.") from error
+
+    cached = read_cached_credentials()
+    if cached:
+        return cached
+
+    while True:
+        try:
+            entered_id = int(input("Enter your Telegram API id: ").strip())
+        except ValueError:
+            print("API id must be an integer. Try again.")
+            continue
+        break
+
+    entered_hash = input("Enter your Telegram API hash: ").strip()
+    if not entered_hash:
+        raise ValueError("API hash cannot be empty.")
+
+    credentials = ApiCredentials(api_id=entered_id, api_hash=entered_hash)
+    save_credentials(credentials)
+    return credentials
+
+
+def chunks(items: list[int], size: int) -> Iterable[list[int]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def is_group(entity: types.TypeChat) -> bool:
+    return isinstance(entity, types.Chat) or (
+        isinstance(entity, types.Channel) and bool(entity.megagroup)
+    )
+
+
+def is_migrated_group(entity: types.TypeChat) -> bool:
+    return isinstance(entity, types.Chat) and entity.migrated_to is not None
+
+
+def chat_title(chat: types.TypeChat, parent_channel: types.Channel | None = None) -> str:
+    title = getattr(chat, "title", None) or "Unknown"
+    username = getattr(chat, "username", None)
+    if username:
+        title = f"{title} (@{username})"
+    if parent_channel:
+        parent = f"@{parent_channel.username}" if parent_channel.username else parent_channel.title
+        title = f"{title} [discussion of {parent or 'Unknown'}]"
+    if is_migrated_group(chat):
+        title = f"{title} [pre-migration history]"
+    return title
+
+
+@dataclass
+class GroupCatalog:
+    groups: list[Group]
+    discussion_parents: dict[int, types.Channel]
 
 
 class Cleaner:
-    def __init__(self, chats=None, search_chunk_size=100, delete_chunk_size=100):
-        self.chats = chats or []
-        self.search_chunk_size = search_chunk_size
+    def __init__(
+        self,
+        client: TelegramClient,
+        delete_chunk_size: int = DELETE_CHUNK_SIZE,
+        status: Callable[[str], None] = print,
+    ) -> None:
+        self.client = client
         self.delete_chunk_size = delete_chunk_size
+        self.status = status
+        self.me: types.User | None = None
 
-    @staticmethod
-    def chunks(l, n):
-        """Yield successive n-sized chunks from l.
-        https://stackoverflow.com/questions/312443/how-do-you-split-a-list-into-evenly-sized-chunks#answer-312464"""
-        for i in range(0, len(l), n):
-            yield l[i:i + n]
+    async def get_groups(self) -> GroupCatalog:
+        """Return all group dialogs, including channel-linked discussions."""
+        groups_by_id: dict[int, Group] = {}
+        channels: list[types.Channel] = []
 
-    @classmethod
-    def _format_chat_title(cls, chat, parent_channel=None):
-        title = chat.title or 'Unknown'
-        if chat.username:
-            title = f'{title} (@{chat.username})'
-        if parent_channel:
-            parent = f'@{parent_channel.username}' if parent_channel.username else parent_channel.title
-            title = f'{title} [discussion of {parent}]'
-        if cls._migrated_to_supergroup(chat):
-            title = f'{title} [pre-migration history]'
-        return title
+        async for dialog in self.client.iter_dialogs():
+            entity = dialog.entity
+            if is_group(entity):
+                groups_by_id[entity.id] = entity
+            elif isinstance(entity, types.Channel):
+                channels.append(entity)
 
-    @staticmethod
-    async def get_all_chats():
-        chats_by_id = {}
-        for chat_list in (0, 1):
-            async for dialog in app.get_dialogs(chat_list=chat_list):
-                if dialog.chat:
-                    chats_by_id[dialog.chat.id] = dialog.chat
-        return list(chats_by_id.values())
-
-    @staticmethod
-    def _is_group_chat(chat):
-        return chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP)
-
-    @staticmethod
-    def _migrated_to_supergroup(chat):
-        """Whether this legacy group has been converted into a supergroup.
-
-        Both chats keep their own dialog entry and share a title, which is why
-        such a group shows up twice in the list. They are not interchangeable:
-        the legacy chat keeps the history from before the migration, and the
-        supergroup does not return it.
-        https://github.com/gurland/telegram-delete-all-messages/issues/56"""
-        return getattr(getattr(chat, '_raw', None), 'migrated_to', None) is not None
-
-    @staticmethod
-    async def get_linked_chat(channel):
-        """Return the discussion group attached to a channel, if there is one."""
-        for attempt in range(2):
-            try:
-                return (await app.get_chat(channel.id)).linked_chat
-            except FloodWait as flood_exception:
-                if attempt:
-                    return None
-                await sleep(flood_exception.value)
-            except Exception:
-                return None
-
-    async def get_groups(self):
-        chats = await self.get_all_chats()
-        groups_by_id = {}
-        discussion_parents = {}
-
-        for chat in chats:
-            if self._is_group_chat(chat):
-                groups_by_id[chat.id] = chat
-
-        channels = [chat for chat in chats if chat.type == enums.ChatType.CHANNEL]
+        discussion_parents: dict[int, types.Channel] = {}
         if channels:
-            print(f'Scanning {len(channels)} channels for linked discussion groups...')
+            self.status(f"Scanning {len(channels)} channels for linked discussion groups...")
 
         for channel in channels:
-            linked = await self.get_linked_chat(channel)
-            if linked and self._is_group_chat(linked):
+            linked = await self._get_linked_chat(channel)
+            if linked:
                 groups_by_id[linked.id] = linked
                 discussion_parents[linked.id] = channel
 
-        groups = sorted(
-            groups_by_id.values(),
-            key=lambda chat: (chat.title or '').lower(),
-        )
-        return groups, discussion_parents
+        groups = sorted(groups_by_id.values(), key=lambda chat: chat_title(chat).lower())
+        return GroupCatalog(groups=groups, discussion_parents=discussion_parents)
 
-    @staticmethod
-    async def resolve_chat(reference):
-        """Look up a chat by id or @username instead of picking it from the list."""
-        try:
-            reference = int(reference)
-        except ValueError:
-            pass
-        return await app.get_chat(reference)
-
-    async def enter_chats_manually(self):
-        """Ask for groups that are missing from the dialog list, e.g. left ones.
-
-        https://github.com/gurland/telegram-delete-all-messages/issues/48"""
-        print(
-            '\nEnter a chat id (like -1001234567890) or a @username, one per line.\n'
-            'Press Enter on an empty line when you are done.'
-        )
-
-        chats = []
-        while True:
-            reference = input('  Chat id or @username: ').strip()
-            if not reference:
-                return chats
-
+    async def _get_linked_chat(self, channel: types.Channel) -> Group | None:
+        """Find the discussion chat attached to a broadcast channel, if present."""
+        for attempt in range(2):
             try:
-                chat = await self.resolve_chat(reference)
-            except Exception as e:
-                print(f'  Could not open "{reference}": {e}')
+                full_channel = await self.client(functions.channels.GetFullChannelRequest(channel))
+                linked_id = full_channel.full_chat.linked_chat_id
+                if not linked_id:
+                    return None
+                linked = await self.client.get_entity(linked_id)
+                return linked if is_group(linked) else None
+            except FloodWaitError as error:
+                if attempt:
+                    return None
+                self.status(f"Flood limit reached, waiting {error.seconds} seconds...")
+                await asyncio.sleep(error.seconds)
+            except Exception:
+                return None
+        return None
+
+    async def resolve_group(self, reference: str) -> Group | None:
+        """Resolve a group by numeric id or @username."""
+        try:
+            entity = await self.client.get_entity(int(reference))
+        except ValueError:
+            entity = await self.client.get_entity(reference)
+        return entity if is_group(entity) else None
+
+    async def enter_groups_manually(self) -> list[Group]:
+        print(
+            "\nEnter a chat id (like -1001234567890) or a @username, one per line.\n"
+            "Press Enter on an empty line when you are done."
+        )
+        groups: list[Group] = []
+        while reference := input("  Chat id or @username: ").strip():
+            try:
+                group = await self.resolve_group(reference)
+            except Exception as error:
+                print(f'  Could not open "{reference}": {error}')
                 continue
-
-            if not self._is_group_chat(chat):
-                print(f'  "{self._format_chat_title(chat)}" is not a group, skipping.')
+            if not group:
+                print(f'  "{reference}" is not a group, skipping.')
                 continue
+            print(f"  Added {chat_title(group)}.")
+            groups.append(group)
+        return groups
 
-            print(f'  Added {self._format_chat_title(chat)}.')
-            chats.append(chat)
-
-    async def select_groups(self, recursive=0):
-        groups, discussion_parents = await self.get_groups()
+    async def select_groups(self) -> list[Group]:
+        catalog = await self.get_groups()
+        groups = catalog.groups
         delete_all_option = len(groups) + 1
         manual_option = len(groups) + 2
 
-        print('Delete all your messages in')
-        print(
-            f'  ({len(groups)} groups found, including archived chats '
-            f'and channel discussions)\n'
-        )
-        for i, group in enumerate(groups):
-            print(f'  {i+1}. {self._format_chat_title(group, discussion_parents.get(group.id))}')
+        print("Delete all your messages in")
+        print(f"  ({len(groups)} groups found, including archived chats and channel discussions)\n")
+        for index, group in enumerate(groups, start=1):
+            print(f"  {index}. {chat_title(group, catalog.discussion_parents.get(group.id))}")
+        print(f"  {delete_all_option}. (!) DELETE ALL YOUR MESSAGES IN ALL OF THOSE GROUPS (!)")
+        print(f"  {manual_option}. Enter a chat id or @username by hand (for groups you have left)\n")
 
-        print(f'  {delete_all_option}. (!) DELETE ALL YOUR MESSAGES IN ALL OF THOSE GROUPS (!)')
-        print(
-            f'  {manual_option}. Enter a chat id or @username by hand '
-            '(for groups you have left)\n'
-        )
+        selected_numbers = self._prompt_selection(manual_option)
+        selected: list[Group] = []
+        manual_groups: list[Group] = []
 
-        nums_str = input('Insert option numbers (comma separated): ')
-        nums = map(lambda s: int(s.strip()), nums_str.split(','))
-
-        for n in nums:
-            if not 1 <= n <= manual_option:
-                print('Invalid option selected. Exiting...')
-                exit(-1)
-
-            if n == delete_all_option:
-                print('\nTHIS WILL DELETE ALL YOUR MESSAGES IN ALL GROUPS!')
-                answer = input('Please type "I understand" to proceed: ')
-                if answer.upper() != 'I UNDERSTAND':
-                    print('Better safe than sorry. Aborting...')
-                    exit(-1)
-                self.chats = groups
+        for number in selected_numbers:
+            if number == delete_all_option:
+                if not self._confirm_delete_all():
+                    return []
+                selected = groups
                 break
-            elif n == manual_option:
-                self.chats.extend(await self.enter_chats_manually())
+            if number == manual_option:
+                manual_groups.extend(await self.enter_groups_manually())
             else:
-                self.chats.append(groups[n - 1])
+                selected.append(groups[number - 1])
 
-        # A chat entered by hand may also be one that was picked from the list.
-        self.chats = list({chat.id: chat for chat in self.chats}.values())
+        selected_by_id = {group.id: group for group in selected}
+        result = list(selected_by_id.values())
+        if result:
+            selected_names = ", ".join(
+                chat_title(group, catalog.discussion_parents.get(group.id)) for group in result
+            )
+            print(f"\nSelected {selected_names}.\n")
 
-        if not self.chats:
-            print('No chats selected. Exiting...')
-            exit(-1)
+        for group in manual_groups:
+            await self.delete_my_messages(group)
 
-        groups_str = ', '.join(
-            self._format_chat_title(c, discussion_parents.get(c.id)) for c in self.chats
+        return result
+
+    @staticmethod
+    def _prompt_selection(maximum: int) -> list[int]:
+        while True:
+            raw_selection = input("Insert option numbers (comma separated): ").strip()
+            try:
+                numbers = [int(value.strip()) for value in raw_selection.split(",") if value.strip()]
+            except ValueError:
+                numbers = []
+            if numbers and all(1 <= number <= maximum for number in numbers):
+                return numbers
+            print("Choose one or more valid option numbers. Try again.")
+
+    @staticmethod
+    def _confirm_delete_all() -> bool:
+        print("\nTHIS WILL DELETE ALL YOUR MESSAGES IN ALL GROUPS!")
+        return input('Please type "I understand" to proceed: ').strip().casefold() == "i understand"
+
+    @staticmethod
+    def _confirm_delete(group: Group, message_count: int) -> bool:
+        print(f'\nFound {message_count} of your messages in "{chat_title(group)}".')
+        print("These messages are about to be permanently deleted.")
+        return (
+            input('Type "delete" to proceed, or press Enter to skip: ')
+            .strip()
+            .casefold()
+            == "delete"
         )
-        print(f'\nSelected {groups_str}.\n')
 
-        if recursive == 1:
-            self.run()
+    async def delete_my_messages(self, group: Group) -> None:
+        if not self.me:
+            self.me = await self.client.get_me()
 
-    async def run(self):
-        for chat in self.chats:
-            chat_id = chat.id
-            message_ids = []
-            add_offset = 0
+        message_ids: list[int] = []
+        async for message in self.client.iter_messages(group, from_user=self.me):
+            message_ids.append(message.id)
+            if len(message_ids) % self.delete_chunk_size == 0:
+                self.status(f'Found {len(message_ids)} of your messages in "{chat_title(group)}"')
 
-            while True:
-                q = await self.search_messages(chat_id, add_offset)
-                message_ids.extend(msg.id for msg in q)
-                messages_count = len(q)
-                print(f'Found {len(message_ids)} of your messages in "{chat.title}"')
-                if messages_count < self.search_chunk_size:
-                    break
-                add_offset += self.search_chunk_size
+        self.status(f'Found {len(message_ids)} of your messages in "{chat_title(group)}"')
 
-            await self.delete_messages(chat_id=chat.id, message_ids=message_ids)
-
-    async def delete_messages(self, chat_id, message_ids):
         if not message_ids:
             return
 
-        print(f'Deleting {len(message_ids)} messages with message IDs:')
-        print(message_ids)
-        for chunk in self.chunks(message_ids, self.delete_chunk_size):
-            while True:
-                try:
-                    await app.delete_messages(chat_id=chat_id, message_ids=chunk, revoke=True)
-                except FloodWait as flood_exception:
-                    # Wait out the limit and retry, otherwise the chunk stays undeleted.
-                    print(f'Flood limit reached, waiting {flood_exception.value} seconds...')
-                    await sleep(flood_exception.value)
-                else:
-                    break
+        if not self._confirm_delete(group, len(message_ids)):
+            self.status(f'Skipping deletion in "{chat_title(group)}".')
+            return
 
-    async def search_messages(self, chat_id, add_offset):
-        messages = []
-        print(f'Searching messages. OFFSET: {add_offset}')
-        async for message in app.search_messages(chat_id=chat_id, offset=add_offset, from_user="me",
-                                                 limit=self.search_chunk_size):
-            messages.append(message)
-        return messages
+        for message_ids_chunk in chunks(message_ids, self.delete_chunk_size):
+            await self._delete_chunk(group, message_ids_chunk)
+
+    async def _delete_chunk(self, group: Group, message_ids: list[int]) -> None:
+        while True:
+            try:
+                await self.client.delete_messages(group, message_ids, revoke=True)
+                return
+            except FloodWaitError as error:
+                self.status(f"Flood limit reached, waiting {error.seconds} seconds...")
+                await asyncio.sleep(error.seconds)
 
 
-def select_login_method():
-    print('\nHow do you want to log in?')
-    print('  1. Phone number and confirmation code')
-    print('  2. QR code')
-
+def select_login_method() -> str:
+    print("\nHow do you want to log in?")
+    print("  1. Phone number and confirmation code")
+    print("  2. QR code")
     while True:
-        choice = input('Insert option number [1]: ').strip() or '1'
-        if choice in ('1', '2'):
+        choice = input("Insert option number [1]: ").strip() or "1"
+        if choice in {"1", "2"}:
             return choice
-        print('Invalid option selected. Try again.')
+        print("Invalid option selected. Try again.")
 
 
-async def ensure_logged_in():
-    """Connect the client, authorizing it first if there is no session yet."""
-    is_authorized = await app.connect()
-
-    if not is_authorized:
-        if select_login_method() == '2':
-            # QR login needs the dispatcher running to be notified about the scan,
-            # so the client gets initialized before instead of after authorization.
-            await app.initialize()
-            await login_with_qr(app)
-        else:
-            await app.authorize()
-
-    await app.invoke(raw.functions.updates.GetState())
-    app.me = await app.get_me()
-
-    if not app.is_initialized:
-        await app.initialize()
+async def ensure_logged_in(client: TelegramClient) -> None:
+    await client.connect()
+    if await client.is_user_authorized():
+        return
+    if select_login_method() == "2":
+        await login_with_qr(client)
+    else:
+        await client.start()
 
 
-async def main():
+async def main() -> None:
+    credentials = load_api_credentials()
+    client = TelegramClient(SESSION_PATH, credentials.api_id, credentials.api_hash)
     try:
-        await ensure_logged_in()
-        deleter = Cleaner()
-        await deleter.select_groups()
-        await deleter.run()
-    except UnknownError as e:
-        print(f'UnknownError occured: {e}')
-        print('Probably API has changed, ask developers to update this utility')
+        await ensure_logged_in(client)
+        cleaner = Cleaner(client)
+        groups = await cleaner.select_groups()
+        if not groups:
+            print("No groups selected. Exiting...")
+            return
+        for group in groups:
+            await cleaner.delete_my_messages(group)
     finally:
-        if app.is_initialized:
-            await app.stop()
-        elif app.is_connected:
-            await app.disconnect()
+        await client.disconnect()
 
 
-app.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
